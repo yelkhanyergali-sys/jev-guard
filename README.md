@@ -2,7 +2,7 @@
 
 > **Ultra-fast In-Flight Terminal Pruning and Surgical Diff Guard for [PI Coding Agent](https://github.com/yelkhanyergali-sys/pi-mono), powered by Jev (TypeSafe AI) — the world's first System One decision model.**
 
-[![Tests](https://img.shields.io/badge/tests-31%20passed-brightgreen.svg)](test/run.js)
+[![Tests](https://img.shields.io/badge/tests-39%20passed-brightgreen.svg)](test/run.js)
 [![Model](https://img.shields.io/badge/Jev-typesafe%2Fjev--1.13-orange.svg)](https://typesafe.ai)
 [![Node](https://img.shields.io/badge/node-%3E%3D18-blue.svg)](package.json)
 [![Prompt Cache](https://img.shields.io/badge/Prompt%20Cache-100%25%20Safe-purple.svg)]()
@@ -53,8 +53,10 @@ Created by Diogo Almeida (ex-OpenAI researcher and co-author of RLHF / InstructG
 - **How jev-guard succeeds:** Pruning occurs **in-flight at the very tail of the turn** *before* the message is appended to the session history array. The preceding conversation prefix remains 100% byte-for-byte identical. **Your 90%+ prompt cache hit rate never drops!**
 
 ### 3. 🚨 Surgical Diff & Secret Guard
-- Intercepts file modification tools (`edit`, `multi-edit`, `ctx_patch`,
-  `ctx_edit`, `write`) at the `tool_call` hook.
+- Intercepts file modification tools (`edit`, `write`, `ctx_edit`, `ctx_patch`,
+  `multi-edit` / `multi_file_edit`, `apply_patch`) at the `tool_call` hook.
+  Both v1 (`multi-edit`) and v2.0.0 (`multi_file_edit` + `apply_patch`) names
+  of the pi-mono-multi-edit family are covered by default.
 - **Two defense layers:**
   1. **Deterministic regex layer** (no network): known secret signatures
      (`sk-...`, `AKIA...`, `-----BEGIN PRIVATE KEY-----`, GitHub/Google/Slack
@@ -89,6 +91,22 @@ All thresholds and tool sets are tunable via env with the `JEV_GUARD_` prefix:
 | `JEV_GUARD_PRUNER_TOOLS` | list | csv of pruner tools |
 | `JEV_GUARD_DIFF_TOOLS` | list | csv of diff-guard tools |
 | `JEV_GUARD_SECRETS_REGEX` | `on` | Deterministic regex secret layer |
+
+All thresholds and tool sets can also be placed in `~/.pi/agent/.env` (same
+`JEV_GUARD_*` names) — session env vars take priority.
+
+### Jev response format (noul / score / choice)
+Jev returns the value in a field **named by the question type**, not a flat
+`probability`. jev-guard parses by type with a legacy fallback:
+
+```json
+{ "has_actionable_error": { "type": "noul", "noul": 0.02 } }
+{ "risk_level":        { "type": "score", "score": 1.12 } }
+{ "log_type":          { "type": "choice", "choice": "tests" } }
+```
+
+Unit-test mocks use this **real** form so the Jev layer can't silently die
+behind a fake `probability` mock again.
 
 ### 7. 📊 Live TUI Telemetry
 - Inspect live statistics in PI Mono anytime via:
@@ -206,7 +224,7 @@ jev-guard/
 │   ├── pruner.js     # In-flight terminal pruning engine
 │   └── diff_guard.js # Surgical diff & secret leak validator (regex + Jev)
 └── test/
-    └── run.js        # Autonomous unit test suite (31 tests)
+    └── run.js        # Autonomous unit test suite (39 tests)
 ```
 
 ---
