@@ -1,0 +1,13 @@
+{
+  "name": "jev-guard",
+  "version": "1.0.0",
+  "description": "Jev System One classifier guard for PI Mono: in-flight terminal pruning (prompt-cache safe) and surgical diff guard against secret/credential edits.",
+  "main": "index.js",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node test/run.js"
+  }
+}
