@@ -216,8 +216,8 @@ test("pruner: collapses long successful output (noul=0.02 < 0.20)", async () => 
     ask: async () => ({ has_actionable_error: noul(0.02) }),
   });
   const res = await pruner.toolResultHandler({ toolName: "bash", content: longOutput(), isError: false });
-  assert.ok(res && typeof res.content === "string");
-  assert.ok(/^\[Output collapsed by jev-guard: 200 lines of successful output, exit code 0\]$/.test(res.content));
+  assert.ok(res && Array.isArray(res.content) && res.content[0] && typeof res.content[0].text === "string");
+  assert.ok(/^\[Output collapsed by jev-guard: 200 lines of successful output, exit code 0\]$/.test(res.content[0].text));
   assert.strictEqual(pruner.stats.collapsed, 1);
 });
 
