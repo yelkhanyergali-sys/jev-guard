@@ -8,7 +8,7 @@
  * Расширение использует Jev в двух защитных ролях:
  *
  *  1) PRUNER — In-Flight Terminal Pruning (tool_result для шелл-инструментов:
- *     bash/shell/powershell/ctx_shell/ctx_execute). Успешный длинный вывод
+ *     bash/shell/powershell). Успешный длинный вывод
  *     (> maxLength) сжимается до head/tail-превью (первые и последние
  *     previewLines строк), если Jev не нашёл ошибок (has_actionable_error <
  *     collapseThreshold). Search-тулы (grep/find/ls) не трогаем: их успешный

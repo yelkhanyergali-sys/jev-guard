@@ -266,7 +266,7 @@ test("pruner: keeps output when Jev detects error (noul=0.9 >= 0.20)", async () 
     ask: async () => ({ has_actionable_error: noul(0.9) }),
     config: { prunerMaxLength: 800 },
   });
-  const res = await pruner.toolResultHandler({ toolName: "ctx_shell", content: longOutput(), isError: false });
+  const res = await pruner.toolResultHandler({ toolName: "bash", content: longOutput(), isError: false });
   assert.strictEqual(res, undefined);
   assert.strictEqual(pruner.stats.collapsed, 0);
 });
@@ -276,14 +276,25 @@ test("pruner: fail-soft keeps output when ask returns null", async () => {
   assert.strictEqual(await pruner.toolResultHandler({ toolName: "bash", content: longOutput(), isError: false }), undefined);
 });
 
-test("pruner: covers shell tools (bash/shell/powershell/ctx_shell/ctx_execute)", async () => {
+test("pruner: covers native shell only (bash/shell/powershell)", async () => {
   const pruner = createPruner({
     ask: async () => ({ has_actionable_error: noul(0.01) }),
     config: { prunerMaxLength: 800 },
   });
-  for (const tool of ["bash", "shell", "powershell", "ctx_shell", "ctx_execute"]) {
+  for (const tool of ["bash", "shell", "powershell"]) {
     const res = await pruner.toolResultHandler({ toolName: tool, content: longOutput(), isError: false });
     assert.ok(res, "expected compression for " + tool);
+  }
+});
+
+test("pruner: leaves ctx_shell/ctx_execute to pi-lean-ctx (no double-truncation)", async () => {
+  const pruner = createPruner({
+    ask: async () => ({ has_actionable_error: noul(0.01) }),
+    config: { prunerMaxLength: 800 },
+  });
+  for (const tool of ["ctx_shell", "ctx_execute"]) {
+    const res = await pruner.toolResultHandler({ toolName: tool, content: longOutput(), isError: false });
+    assert.strictEqual(res, undefined, tool + ": эти тулы сам обрезает lean-ctx");
   }
 });
 
@@ -541,7 +552,8 @@ test("config: defaults — shell-only pruner, search tools excluded", () => {
   assert.strictEqual(def.prunerPreviewLines, 10);
   assert.strictEqual(def.collapseThreshold, 0.2);
   assert.strictEqual(def.secretsThreshold, 0.8);
-  assert.ok(def.prunerTools.includes("ctx_execute"));
+  assert.ok(def.prunerTools.includes("bash"));
+  assert.ok(!def.prunerTools.includes("ctx_execute"), "ctx_* — зона pi-lean-ctx, не воюем");
   assert.ok(def.prunerTools.includes("bash"));
   // Успешный вывод grep/find/ls — это ДАННЫЕ: прунер их не трогает.
   assert.ok(!def.prunerTools.includes("grep"));
