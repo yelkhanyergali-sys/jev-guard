@@ -2,7 +2,7 @@
 
 > **Ultra-fast In-Flight Terminal Pruning and Surgical Diff Guard for [PI Coding Agent](https://github.com/yelkhanyergali-sys/pi-mono), powered by Jev (TypeSafe AI) — the world's first System One decision model.**
 
-[![Tests](https://img.shields.io/badge/tests-39%20passed-brightgreen.svg)](test/run.js)
+[![Tests](https://img.shields.io/badge/tests-47%20passed-brightgreen.svg)](test/run.js)
 [![Model](https://img.shields.io/badge/Jev-typesafe%2Fjev--1.13-orange.svg)](https://typesafe.ai)
 [![Node](https://img.shields.io/badge/node-%3E%3D18-blue.svg)](package.json)
 [![Prompt Cache](https://img.shields.io/badge/Prompt%20Cache-100%25%20Safe-purple.svg)]()
@@ -12,11 +12,17 @@
 
 ## ⚡ The Problem: Coding Agent Context Bloat & Cache Destruction
 
-Modern AI coding agents (Claude Code, Cursor, PI Mono) suffer from two fundamental problems during heavy development sessions:
+Modern AI coding agents (Claude Code, Cursor, PI Mono) suffer from three fundamental problems during heavy development sessions:
 
 1. **Terminal Log Bloat:** Running `cargo test`, `pytest`, or `npm run build` dumps 500–1,000 lines of raw compiler/test logs into the conversation context. After 15 runs, **20,000+ tokens of pure boilerplate** pollute the context window, causing models to forget initial project instructions (*Lost in the Middle* effect).
 2. **The Prompt Cache Trap:** Traditional compaction via LLMs summarizes past history. But retroactively rewriting older messages **breaks the frozen byte-prefix**, destroying 80–99% prompt cache hit rates and forcing expensive full-token re-billing.
 3. **Accidental Credential Modifications (Drive-By Edits):** Agents occasionally hallucinate or over-edit, overwriting `.env` files, API keys, or certificates before human review.
+
+`jev-guard` addresses all three with a typed decision model instead of an LLM —
+and the pruning half is deliberately **surgical**: it only touches shell
+output, keeps the informative head and tail, and never competes with the
+context tool (`pi-lean-ctx`) that already truncates file/search results.
+Manual `/compact` in PI Mono is untouched — jev-guard has no compaction hook.
 
 ---
 
@@ -32,21 +38,32 @@ Created by Diogo Almeida (ex-OpenAI researcher and co-author of RLHF / InstructG
 
 ## ✨ Key Features ("Все плюшки")
 
-### 1. 🧹 In-Flight Terminal Pruning (98.5% Token Reduction)
-- Intercepts terminal tools at the `tool_result` event boundary: `bash`, `shell`,
-  `powershell`, `ctx_shell`, `ctx_execute`, `grep`, `ctx_grep`, `find`,
-  `ctx_find`, `ls` (set via `JEV_GUARD_PRUNER_TOOLS`).
+### 1. 🧹 In-Flight Terminal Pruning (lossy-safe head/tail)
+- Intercepts **shell** tools only at the `tool_result` event boundary:
+  `bash`, `shell`, `powershell`, `ctx_shell`, `ctx_execute`
+  (set via `JEV_GUARD_PRUNER_TOOLS`). Search tools (`grep`, `find`, `ls`,
+  `ctx_grep`, `ctx_find`) are deliberately **not** pruned — their successful
+  output *is* the data the agent needs, and `pi-lean-ctx` already truncates
+  it natively. One pruning layer, not two.
 - If a command succeeds (`isError === false`) and the output exceeds
-  `JEV_GUARD_MAX_LENGTH` (default 800) characters, Jev evaluates:
+  `JEV_GUARD_MAX_LENGTH` (default 4000) characters **and** has more than
+  `2 × JEV_GUARD_PREVIEW_LINES` lines, Jev evaluates:
   ```json
   "has_actionable_error": { "type": "noul", "instructions": "Does this terminal output contain an error or failure requiring fixing?" }
   ```
 - If `has_actionable_error < JEV_GUARD_COLLAPSE_THRESHOLD` (default 0.20):
-  The 1,000-line output is collapsed into a single lightweight token line:
+  the middle of the log is dropped, the head and tail are kept verbatim:
   ```text
-  [Output collapsed by jev-guard: 45 lines of successful output, exit code 0]
+  line 0: Compiling librefang-kernel v0.1.0
+  ...first 10 lines...
+  [... 180 lines omitted by jev-guard: clean output, exit code 0 ...]
+  ...last 10 lines...
+  Finished dev [unoptimized + debuginfo] target(s) in 42.13s
   ```
-- **Real-world saving:** A 1,000-token test suite dump shrinks to **15 tokens**.
+- **Why not a single collapsed line:** the first lines carry the command
+  banner and the last carry the exit summary. Erasing everything made the
+  agent re-run the command to see what it had just printed — costing more
+  tokens than the pruning saved.
 
 ### 2. 🔒 100% Byte-Stable Prompt Cache Preservation
 - **Why other pruners fail:** Modifying past history breaks the prefix cache.
@@ -58,10 +75,15 @@ Created by Diogo Almeida (ex-OpenAI researcher and co-author of RLHF / InstructG
   Both v1 (`multi-edit`) and v2.0.0 (`multi_file_edit` + `apply_patch`) names
   of the pi-mono-multi-edit family are covered by default.
 - **Two defense layers:**
-  1. **Deterministic regex layer** (no network): known secret signatures
+  1. **Deterministic regex layer** (no network): known secret *literals*
      (`sk-...`, `AKIA...`, `-----BEGIN PRIVATE KEY-----`, GitHub/Google/Slack
-     tokens, JWT, `*_KEY=`/`PASSWORD=`/`SECRET=` assignments in `.env`) →
-     **instant block** without a single Jev call. Toggle: `JEV_GUARD_SECRETS_REGEX`.
+     tokens, 3-segment JWT, `*_KEY=`/`PASSWORD=`/`SECRET=` assignments).
+     Assignment values that are references (`$FOO`, `%{...}`, `os.environ`,
+     `process.env`, `config.x`) or documentation placeholders
+     (`sk-XXXX`, `sk-your-key-here`, `sk-example`) are **not** flagged —
+     otherwise every legitimate `.env.example` edit gets blocked.
+     A hit → **instant block** without a single Jev call.
+     Toggle: `JEV_GUARD_SECRETS_REGEX`.
   2. **Jev layer:** `modifies_secrets`. If `> JEV_GUARD_SECRETS_THRESHOLD`
      (default 0.80), the operation is **immediately blocked before touching
      the disk**:
@@ -70,12 +92,17 @@ Created by Diogo Almeida (ex-OpenAI researcher and co-author of RLHF / InstructG
   ```
 - **is_surgical (advisory):** second Jev question. When probability is low
   (`< JEV_GUARD_SURGICAL_THRESHOLD`, default 0.20) — suspected drive-by
-  refactoring → **warn** in the log (does NOT block; the core blocks only on
-  `block`). Controlled by `JEV_GUARD_SURGICAL_ACTION` (`warn` | `off`).
+  refactoring → **notification in the TUI** via `ctx.ui.notify(msg,
+  "warning")` plus the log. It does NOT block: the PI core acts only on
+  `block`, so a `{warn: true}` return value would be silently discarded.
+  Controlled by `JEV_GUARD_SURGICAL_ACTION` (`warn` | `off`).
 
 ### 4. 🦺 Fail-Soft Architecture (Zero Workflow Interruption)
 - Strict **2.0-second timeout** (`AbortSignal.timeout(2000)`).
 - If OpenRouter, TypeSafe API, or the network encounters an error (HTTP 404, 429, timeout), `jev-guard` **never crashes or blocks the agent**. It logs a silent warning and passes the original output through untouched.
+- **Bounded request size:** the `state` sent to Jev is capped at 12k
+  characters (8k head + 4k tail). A 500 KB build log neither gets billed in
+  full nor silently truncated at the API's 32k-token limit mid-decision.
 
 ### 6. ⚙️ Runtime Configuration (no code edits)
 All thresholds and tool sets are tunable via env with the `JEV_GUARD_` prefix:
@@ -83,14 +110,16 @@ All thresholds and tool sets are tunable via env with the `JEV_GUARD_` prefix:
 | Variable | Default | Description |
 |---|---|---|
 | `JEV_GUARD_ENABLED` | `on` | Enable/disable the extension |
-| `JEV_GUARD_MAX_LENGTH` | `800` | Collapse output longer than this (chars) |
-| `JEV_GUARD_COLLAPSE_THRESHOLD` | `0.20` | `has_actionable_error` below → collapse |
+| `JEV_GUARD_MAX_LENGTH` | `4000` | Prune output longer than this (chars) |
+| `JEV_GUARD_PREVIEW_LINES` | `10` | Head/tail lines kept when pruning |
+| `JEV_GUARD_COLLAPSE_THRESHOLD` | `0.20` | `has_actionable_error` below → prune |
 | `JEV_GUARD_SECRETS_THRESHOLD` | `0.80` | `modifies_secrets` above → block |
-| `JEV_GUARD_SURGICAL_THRESHOLD` | `0.20` | `is_surgical` below → warn |
+| `JEV_GUARD_SURGICAL_THRESHOLD` | `0.20` | `is_surgical` below → notify |
 | `JEV_GUARD_SURGICAL_ACTION` | `warn` | `warn` \| `off` |
-| `JEV_GUARD_PRUNER_TOOLS` | list | csv of pruner tools |
+| `JEV_GUARD_PRUNER_TOOLS` | shell tools | csv of pruner tools |
 | `JEV_GUARD_DIFF_TOOLS` | list | csv of diff-guard tools |
 | `JEV_GUARD_SECRETS_REGEX` | `on` | Deterministic regex secret layer |
+| `JEV_GUARD_LOG` | `~/.pi/agent/jev-guard.log` | Log file path (also how tests stay out of the real log) |
 
 All thresholds and tool sets can also be placed in `~/.pi/agent/.env` (same
 `JEV_GUARD_*` names) — session env vars take priority.
@@ -120,9 +149,9 @@ behind a fake `probability` mock again.
 ## 🏗️ Architecture Pipeline
 
 ```
-                     [Agent executes bash command / test run]
+                     [Agent executes a shell command / test run]
                                         │
-                                        ▼ (Output > 800 chars)
+                                        ▼ (Output > 4000 chars)
                             ┌───────────────────────┐
                             │   pi.on("tool_result")│
                             └─────────────────���─────┘
@@ -137,7 +166,7 @@ behind a fake `probability` mock again.
                                   /            \
                              YES /              \ NO (or error)
                                 ▼                ▼
-               [Collapse to 1 line]          [Keep full verbatim log]
+               [Prune middle → head+tail preview]  [Keep full verbatim log]
                                 \                /
                                  ▼              ▼
                      [Commit to Session History (Tail)]
@@ -195,18 +224,24 @@ node test/run.js
 **Test Coverage:**
 - ✅ English question/criteria structure calibration
 - ✅ Calibrated `noul` probability evaluation (`p < 0.20` threshold)
-- ✅ Long successful bash output collapsing
+- ✅ Long successful shell output → head/tail preview (`savedChars` accounting)
 - ✅ Preserving outputs on test failures / exceptions (`isError` or `p >= 0.20`)
-- ✅ Preserving short outputs (< maxLength chars)
-- ✅ Extended pruner tools (`ctx_execute`, `grep`, `find`, `ls`)
+- ✅ Preserving short outputs (< maxLength chars) and single-line outputs
+- ✅ Search tools (`grep`, `find`, `ls`, `ctx_*`) never pruned; shell tools always are
 - ✅ Secret modification blocking via Jev (`modifies_secrets > 0.80`)
 - ✅ Secret blocking via deterministic regex layer (no Jev call)
-- ✅ `write` tool covered by diff guard
-- ✅ `is_surgical` advisory warn (non-blocking) + `off` mode
-- ✅ Runtime config overrides (thresholds + tool sets)
+- ✅ Regex **false positives** stay allowed (`$API_KEY`, `os.environ[...]`,
+  `config.password`, `sk-XXXX`, `sk-your-key-here`, bare hex hashes)
+- ✅ `write` / `apply_patch` / `multi_file_edit` covered by diff guard
+- ✅ `is_surgical` advisory reaches `ctx.ui.notify` (non-blocking) + `off` mode
+- ✅ Advisory never crashes when `ctx.ui` is absent
+- ✅ Runtime config overrides (thresholds + tool sets + `JEV_GUARD_LOG`)
 - ✅ `extractDiff` returns null on empty diff (no JSON dump)
+- ✅ `truncateState` keeps head + tail within the request cap
 - ✅ Permitting safe, surgical code changes
 - ✅ Fail-soft resilience (HTTP 404, 429, timeout, missing key)
+- ✅ Test isolation: the suite runs against a temp `HOME` and never writes to
+  the production log
 
 ---
 
@@ -224,7 +259,7 @@ jev-guard/
 │   ├── pruner.js     # In-flight terminal pruning engine
 │   └── diff_guard.js # Surgical diff & secret leak validator (regex + Jev)
 └── test/
-    └── run.js        # Autonomous unit test suite (39 tests)
+    └── run.js        # Autonomous unit test suite (47 tests)
 ```
 
 ---

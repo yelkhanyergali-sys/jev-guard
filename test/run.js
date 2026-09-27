@@ -3,6 +3,9 @@
 /**
  * jev-guard / test/run.js — быстрые автономные юнит-тесты (без интернета).
  *
+ * ИЗОЛЯЦИЯ: тесты подменяют HOME и JEV_GUARD_LOG на временную директорию —
+ * иначе client.log.warn пишет тестовый шум в боевой ~/.pi/agent/jev-guard.log.
+ *
  * ВАЖНО: моки ответов Jev используют РЕАЛЬНУЮ форму API — значение лежит в
  * поле ПО ТИПУ вопроса, т.е. для noul это `{ type:"noul", noul: 0.02 }`,
  * а НЕ плоское `{ probability: 0.02 }`. Раньше моки копировали неверную
@@ -16,23 +19,31 @@
  *
  * Покрытие:
  *   1. noul-парсинг по типу (поле noul) + fallback на probability.
- *   2. Структура запроса questions (инструкции на английском).
- *   3. Сворачивание успешного длинного вывода терминала.
- *   4. Сохранение вывода с ошибкой (isError / Jev-ошибка) без изменений.
- *   5. Блокировка диффа (regex-слой + Jev-слой) при правке секретов.
- *   6. is_surgical → warn (advisory), не блокирует.
- *   7. Runtime-конфиг (JEV_GUARD_* env): пороги и наборы инструментов.
- *   8. Fail-Soft при ошибке сети / HTTP / таймауте / нет ключа.
+ *   2. Структура запроса questions + truncateState.
+ *   3. Fail-Soft при ошибке сети / HTTP / таймауте / нет ключа.
+ *   4. PRUNER: head/tail-сжатие длинного успешного вывода шелл-тулов.
+ *   5. PRUNER: search-тулы (grep/find/ls) НЕ сжимаются; isError/короткий — нет.
+ *   6. Блокировка диффа (regex + Jev) и отсутствие ложных срабатываний regex.
+ *   7. is_surgical → ctx.ui.notify (advisory), не блокирует.
+ *   8. Runtime-конфиг (JEV_GUARD_* env): пороги, тулы, путь лога.
  *   9. extractDiff: apply_patch (input), Codex-patch (patch), пустой дифф → null.
  *
  * Запуск: node test/run.js
  */
 
 const assert = require("assert");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+// Изоляция до загрузки модулей: HOME и лог — во временную директорию.
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "jev-guard-test-"));
+process.env.HOME = TMP;
+process.env.JEV_GUARD_LOG = path.join(TMP, "jev-guard.log");
 
 const client = require("../lib/client");
-const { loadConfig } = require("../lib/config");
-const { createPruner, extractText, lineCount, collapseLine, DEFAULT_MAX_LENGTH, DEFAULT_COLLAPSE_THRESHOLD } = require("../lib/pruner");
+const { loadConfig, logPath } = require("../lib/config");
+const { createPruner, extractText, lineCount, compressHeadTail, DEFAULT_MAX_LENGTH, DEFAULT_COLLAPSE_THRESHOLD, DEFAULT_PREVIEW_LINES } = require("../lib/pruner");
 const { createDiffGuard, extractDiff, hasSecretSignature, DEFAULT_SECRETS_THRESHOLD } = require("../lib/diff_guard");
 
 let passed = 0;
@@ -68,6 +79,7 @@ function resetEnv() {
 function cleanup() {
   global.fetch = originalFetch;
   resetEnv();
+  try { fs.rmSync(TMP, { recursive: true, force: true }); } catch { /* noop */ }
 }
 
 function okResponse(body) {
@@ -160,6 +172,16 @@ test("client: direct typesafe URL when TYPESAFE_API_KEY set", async () => {
   assert.strictEqual(captured, "https://api.typesafe.ai/v1/decisions");
 });
 
+test("client: truncateState caps payload, keeps head+tail", () => {
+  assert.strictEqual(client.truncateState("abc"), "abc");
+  const big = "H".repeat(20000) + "TAILMARK";
+  const t = client.truncateState(big);
+  assert.ok(t.length < big.length, "длинный state усекается");
+  assert.ok(t.startsWith("HHHH"), "head сохранён");
+  assert.ok(t.includes("TAILMARK"), "tail сохранён (финальный статус-лайн важен)");
+  assert.ok(t.includes("chars omitted"));
+});
+
 // ============================================================================
 // 2. CLIENT — fail-soft
 // ============================================================================
@@ -209,19 +231,25 @@ test("client: fail-soft returns null when no API key (no fetch)", async () => {
 });
 
 // ============================================================================
-// 3. PRUNER
+// 3. PRUNER — head/tail-сжатие (вывод сохраняется частично, не стирается)
 // ============================================================================
-test("pruner: collapses long successful output (noul=0.02 < 0.20)", async () => {
+test("pruner: compresses long successful output to head/tail preview", async () => {
   const pruner = createPruner({
     ask: async () => ({ has_actionable_error: noul(0.02) }),
+    config: { prunerMaxLength: 800, prunerPreviewLines: 10 },
   });
   const res = await pruner.toolResultHandler({ toolName: "bash", content: longOutput(), isError: false });
   assert.ok(res && Array.isArray(res.content) && res.content[0] && typeof res.content[0].text === "string");
-  assert.ok(/^\[Output collapsed by jev-guard: 200 lines of successful output, exit code 0\]$/.test(res.content[0].text));
+  const text = res.content[0].text;
+  assert.ok(text.startsWith("line 0: some build output"), "head сохранён");
+  assert.ok(text.endsWith("line 199: some build output"), "tail сохранён");
+  assert.ok(text.includes("[... 180 lines omitted by jev-guard: clean output, exit code 0 ...]"), "маркер середины");
+  assert.ok(text.length < longOutput().length, "вывод реально короче");
   assert.strictEqual(pruner.stats.collapsed, 1);
+  assert.ok(pruner.stats.savedChars > 0, "статистика экономии ведётся");
 });
 
-test("pruner: keeps short output (<800) untouched", async () => {
+test("pruner: keeps short output (<maxLength) untouched", async () => {
   const pruner = createPruner({ ask: async () => ({ has_actionable_error: noul(0) }) });
   const res = await pruner.toolResultHandler({ toolName: "bash", content: "ok", isError: false });
   assert.strictEqual(res, undefined);
@@ -229,13 +257,14 @@ test("pruner: keeps short output (<800) untouched", async () => {
 });
 
 test("pruner: keeps isError=true untouched even if long", async () => {
-  const pruner = createPruner({ ask: async () => ({ has_actionable_error: noul(0) }) });
+  const pruner = createPruner({ ask: async () => ({ has_actionable_error: noul(0) }), config: { prunerMaxLength: 800 } });
   assert.strictEqual(await pruner.toolResultHandler({ toolName: "bash", content: longOutput(), isError: true }), undefined);
 });
 
 test("pruner: keeps output when Jev detects error (noul=0.9 >= 0.20)", async () => {
   const pruner = createPruner({
     ask: async () => ({ has_actionable_error: noul(0.9) }),
+    config: { prunerMaxLength: 800 },
   });
   const res = await pruner.toolResultHandler({ toolName: "ctx_shell", content: longOutput(), isError: false });
   assert.strictEqual(res, undefined);
@@ -243,32 +272,40 @@ test("pruner: keeps output when Jev detects error (noul=0.9 >= 0.20)", async () 
 });
 
 test("pruner: fail-soft keeps output when ask returns null", async () => {
-  const pruner = createPruner({ ask: async () => null });
+  const pruner = createPruner({ ask: async () => null, config: { prunerMaxLength: 800 } });
   assert.strictEqual(await pruner.toolResultHandler({ toolName: "bash", content: longOutput(), isError: false }), undefined);
 });
 
-test("pruner: covers extended tools (ctx_execute, grep, find)", async () => {
+test("pruner: covers shell tools (bash/shell/powershell/ctx_shell/ctx_execute)", async () => {
   const pruner = createPruner({
     ask: async () => ({ has_actionable_error: noul(0.01) }),
+    config: { prunerMaxLength: 800 },
   });
-  for (const tool of ["ctx_execute", "grep", "find", "ls"]) {
+  for (const tool of ["bash", "shell", "powershell", "ctx_shell", "ctx_execute"]) {
     const res = await pruner.toolResultHandler({ toolName: tool, content: longOutput(), isError: false });
-    assert.ok(res, "expected collapse for " + tool);
+    assert.ok(res, "expected compression for " + tool);
   }
 });
 
-test("pruner: ignores non-target tools (read)", async () => {
-  const pruner = createPruner({ ask: async () => ({ has_actionable_error: noul(0) }) });
-  assert.strictEqual(await pruner.toolResultHandler({ toolName: "read", content: longOutput(), isError: false }), undefined);
+test("pruner: does NOT touch search tools (grep/find/ls/ctx_*/read)", async () => {
+  const pruner = createPruner({
+    ask: async () => ({ has_actionable_error: noul(0.0) }),
+    config: { prunerMaxLength: 800 },
+  });
+  for (const tool of ["grep", "ctx_grep", "find", "ctx_find", "ls", "ctx_ls", "ctx_read", "read"]) {
+    const res = await pruner.toolResultHandler({ toolName: tool, content: longOutput(), isError: false });
+    assert.strictEqual(res, undefined, tool + ": вывод — это данные, не шум");
+  }
+  assert.strictEqual(pruner.stats.checked, 0, "Jev вообще не дёргается для search-тулов");
 });
 
-test("pruner: respects runtime maxLength override (config)", async () => {
+test("pruner: single-line long output untouched (нечего превьющить)", async () => {
   const pruner = createPruner({
     ask: async () => ({ has_actionable_error: noul(0.01) }),
-    config: { prunerMaxLength: 10, collapseThreshold: 0.2 },
+    config: { prunerMaxLength: 10 },
   });
   const res = await pruner.toolResultHandler({ toolName: "bash", content: "012" + "3456789" + "ABCDEFGHIJ", isError: false });
-  assert.ok(res, "output longer than maxLength(10) should collapse");
+  assert.strictEqual(res, undefined, "одна строка не сжимается — превью из неё не сделать");
 });
 
 test("pruner: respects runtime collapseThreshold override (config)", async () => {
@@ -278,6 +315,14 @@ test("pruner: respects runtime collapseThreshold override (config)", async () =>
   });
   const res = await pruner.toolResultHandler({ toolName: "bash", content: longOutput(), isError: false });
   assert.strictEqual(res, undefined, "0.15 >= 0.10 threshold → keep");
+});
+
+test("compressHeadTail: pure helper", () => {
+  assert.strictEqual(compressHeadTail("a\nb\nc", 2), null); // строк <= 2*n
+  const t = compressHeadTail(Array.from({ length: 5 }, (_, i) => `L${i}`).join("\n"), 2);
+  assert.strictEqual(t.split("\n")[0], "L0");
+  assert.strictEqual(t.split("\n").pop(), "L4");
+  assert.ok(t.includes("1 lines omitted"));
 });
 
 // ============================================================================
@@ -328,6 +373,29 @@ test("diff_guard: regex layer blocks PEM private key", async () => {
   assert.strictEqual(hasSecretSignature(PEM_KEY), true);
 });
 
+// --- ложные срабатывания regex: гард не должен ломать рабочие правки ---
+test("regex: placeholder/doc sk- examples NOT blocked", () => {
+  assert.strictEqual(hasSecretSignature("key = sk-" + "X".repeat(30)), false, "sk-XXXX — плейсхолдер");
+  assert.strictEqual(hasSecretSignature("OPENAI_API_KEY=sk-you" + "r-key-here-xx"), false, "sk-your-key — док-пример");
+  assert.strictEqual(hasSecretSignature("token: sk-" + "example1234567890a"), false, "sk-example… — док-пример");
+});
+
+test("regex: env-var references and lookups NOT blocked", () => {
+  assert.strictEqual(hasSecretSignature('API_KEY = "$MY_API_KEY"'), false, "ссылка на переменную");
+  assert.strictEqual(hasSecretSignature('SECRET_KEY = os.environ["SECRET_KEY"]'), false, "env-lookup");
+  assert.strictEqual(hasSecretSignature("PASSWORD = config.password"), false, "атрибут конфига");
+});
+
+test("regex: bare eyJ-hash NOT blocked, real JWT blocked", () => {
+  assert.strictEqual(hasSecretSignature("hash = eyJ" + "AbCdEf1234567890AbCdEf123"), false, "похоже на хеш, не JWT");
+  const jwt = "eyJhbGciOiJIUzI1NiJ9." + "eyJzdWIiOiIxMjM0NTY3ODkwIn0." + "dZgPqE4T7Zk0mYw3Xr8VbNcLsTqUeFhIj";
+  assert.strictEqual(hasSecretSignature("Authorization: Bearer " + jwt), true, "полноформатный JWT");
+});
+
+test("regex: real-looking sk- key still blocked", () => {
+  assert.strictEqual(hasSecretSignature("openai: " + SK_TOKEN), true);
+});
+
 test("diff_guard: does not block benign diff (noul=0.1)", async () => {
   const g = createDiffGuard({
     ask: async () => ({
@@ -343,21 +411,39 @@ test("diff_guard: does not block benign diff (noul=0.1)", async () => {
   assert.strictEqual(g.stats.blocked, 0);
 });
 
-test("diff_guard: is_surgical low → warn (advisory, not block)", async () => {
+test("diff_guard: is_surgical low → ui.notify (advisory), не block", async () => {
   const g = createDiffGuard({
     ask: async () => ({
       modifies_secrets: noul(0.05),
       is_surgical: noul(0.05),
     }),
   });
+  const notices = [];
+  const ctx = { ui: { notify: (msg, type) => notices.push({ msg, type }) } };
   const res = await g.toolCallHandler({
     toolName: "edit",
     input: { edits: [{ oldText: "a", newText: "b" }] },
+  }, ctx);
+  // Контракт ядра (ToolCallEventResult) знает только block/reason/terminate:
+  // поле `warn` игнорировалось, поэтому предупреждение идёт в ctx.ui.notify.
+  assert.strictEqual(res, undefined, "advisory НЕ должен возвращать результат");
+  assert.strictEqual(notices.length, 1, "уведомление доставлено в UI");
+  assert.strictEqual(notices[0].type, "warning");
+  assert.ok(/drive-by/.test(notices[0].msg));
+  assert.strictEqual(g.stats.warned, 1);
+  // Шум ушёл в изолированный tmp-лог, а не в боевой ~/.pi/agent/jev-guard.log.
+  assert.ok(logPath().startsWith(TMP), "лог перенаправлен в tmp");
+  assert.ok(fs.readFileSync(logPath(), "utf8").includes("drive-by"), "запись в tmp-логе");
+});
+
+test("diff_guard: warn не падает без ctx.ui", async () => {
+  const g = createDiffGuard({
+    ask: async () => ({ modifies_secrets: noul(0.05), is_surgical: noul(0.05) }),
   });
-  assert.ok(res, "должен вернуть warn-объект");
-  assert.ok(res.warn === true);
-  assert.strictEqual(res.block, undefined, "warn НЕ должен блокировать");
-  assert.ok(res.reason.includes("drive-by"));
+  assert.strictEqual(await g.toolCallHandler(
+    { toolName: "edit", input: { edits: [{ oldText: "a", newText: "b" }] } },
+    {},
+  ), undefined);
   assert.strictEqual(g.stats.warned, 1);
 });
 
@@ -449,17 +535,30 @@ test("extractDiff: returns null for empty/absent diff (no JSON dump)", () => {
   assert.strictEqual(extractDiff({ path: "x.js", edits: [{ oldText: "  ", newText: "" }] }), null);
 });
 
-test("config: defaults include multi_file_edit and apply_patch", () => {
+test("config: defaults — shell-only pruner, search tools excluded", () => {
   const def = loadConfig();
-  assert.strictEqual(def.prunerMaxLength, 800);
+  assert.strictEqual(def.prunerMaxLength, 4000);
+  assert.strictEqual(def.prunerPreviewLines, 10);
   assert.strictEqual(def.collapseThreshold, 0.2);
   assert.strictEqual(def.secretsThreshold, 0.8);
   assert.ok(def.prunerTools.includes("ctx_execute"));
+  assert.ok(def.prunerTools.includes("bash"));
+  // Успешный вывод grep/find/ls — это ДАННЫЕ: прунер их не трогает.
+  assert.ok(!def.prunerTools.includes("grep"));
+  assert.ok(!def.prunerTools.includes("ctx_grep"));
+  assert.ok(!def.prunerTools.includes("find"));
+  assert.ok(!def.prunerTools.includes("ls"));
   // Fix C: реальные имена тулов multi-файлового эдитора покрыты
   assert.ok(def.diffTools.includes("multi-edit"));
   assert.ok(def.diffTools.includes("multi_file_edit"));
   assert.ok(def.diffTools.includes("apply_patch"));
   assert.ok(def.diffTools.includes("write"));
+});
+
+test("config: JEV_GUARD_LOG redirects the log path", () => {
+  process.env.JEV_GUARD_LOG = path.join(TMP, "custom.log");
+  assert.strictEqual(logPath(), path.join(TMP, "custom.log"));
+  resetEnv();
 });
 
 test("config: env override (session) and defaults", () => {
@@ -478,8 +577,9 @@ test("config: env override (session) and defaults", () => {
 });
 
 test("defaults constants exported", () => {
-  assert.strictEqual(DEFAULT_MAX_LENGTH, 800);
+  assert.strictEqual(DEFAULT_MAX_LENGTH, 4000);
   assert.strictEqual(DEFAULT_COLLAPSE_THRESHOLD, 0.2);
+  assert.strictEqual(DEFAULT_PREVIEW_LINES, 10);
   assert.strictEqual(DEFAULT_SECRETS_THRESHOLD, 0.8);
 });
 
