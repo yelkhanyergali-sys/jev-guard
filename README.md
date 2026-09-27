@@ -2,11 +2,21 @@
 
 > **Ultra-fast In-Flight Terminal Pruning and Surgical Diff Guard for [PI Coding Agent](https://github.com/yelkhanyergali-sys/pi-mono), powered by Jev (TypeSafe AI) — the world's first System One decision model.**
 
-[![Tests](https://img.shields.io/badge/tests-47%20passed-brightgreen.svg)](test/run.js)
+[![Tests](https://img.shields.io/badge/tests-48%20passed-brightgreen.svg)](test/run.js)
 [![Model](https://img.shields.io/badge/Jev-typesafe%2Fjev--1.13-orange.svg)](https://typesafe.ai)
 [![Node](https://img.shields.io/badge/node-%3E%3D18-blue.svg)](package.json)
 [![Prompt Cache](https://img.shields.io/badge/Prompt%20Cache-100%25%20Safe-purple.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+> **Status: not in use (kept as reference).** Since 2026-09-28 this extension is no
+> longer listed in PI's `settings.json`, so it does not load. Terminal-output
+> compression is handled by [`pi-lean-ctx`](https://github.com/yvgude/lean-ctx),
+> which compresses at the source with measured metering instead of post-factum
+> head/tail cutting, and covers `ctx_*` tools jev never reached. The diff guard
+> here was also found to be theatre: a secret pasted into chat is already in the
+> session context and already billed to the provider — blocking the file write
+> hides nothing while interrupting legitimate work. Real leak control lives at the
+> publish boundary instead. Code and tests are maintained for reference.
 
 ---
 
@@ -259,7 +269,7 @@ jev-guard/
 │   ├── pruner.js     # In-flight terminal pruning engine
 │   └── diff_guard.js # Surgical diff & secret leak validator (regex + Jev)
 └── test/
-    └── run.js        # Autonomous unit test suite (47 tests)
+    └── run.js        # Autonomous unit test suite (48 tests)
 ```
 
 ---
